@@ -6,7 +6,9 @@ import sys
 
 
 class mpc_controller:
-    def __init__(self, Q, R, QT, ulim, ylim, MT, mt, horizon=10):
+    def __init__(self, model, Q, R, QT, ulim, ylim, MT, mt, horizon=10):
+
+        self.model = model
         self.Q = Q
         self.R = R
         self.QT = QT
@@ -16,19 +18,18 @@ class mpc_controller:
         self.mt = mt
         self.horizon = horizon
 
-    def control_action(self, system):
-        x_horz, u_horz = self.compute_optimal_horizon(system)
+    def control_action(self):
+        x_horz, u_horz = self.compute_optimal_horizon()
         return u_horz[:, 0]
 
-    def compute_optimal_horizon(self, system):
+    def compute_optimal_horizon(self):
         # in this method the optimization is done
         # x0 is updated every iteration in pendulum_sim
 
-        x0 = system.get_current_state()
-        A = system.linearlize_pendulum(x0[0], x0[1])
-        B = system.B
-        C = system.C
+        x0 = self.model.get_current_state().T
+        A, B, C, _ = self.model.get_system()
 
+        # setup free varialbes
         n, m = B.shape
         x = cp.Variable((n, self.horizon + 1))
         u = cp.Variable((m, self.horizon))
@@ -38,18 +39,18 @@ class mpc_controller:
 
         for t in range(self.horizon):
             cost += cp.quad_form(x[:, t], self.Q) + cp.quad_form(u[:, t], self.R)
-            constr += [x[:, t + 1] == A @ x[:, t] + B @ u[:, t]]
-            constr += [-self.ulim <= u[:, [t]], u[:, [t]] <= self.ulim]
-            constr += [
-                -self.ylim <= C @ x[:, [t]],
-                C @ x[:, [t]] <= self.ylim,
-            ]
+            # constr += [x[:, t + 1] == A @ x[:, t] + B @ u[:, t]]
+            # constr += [-self.ulim <= u[:, [t]], u[:, [t]] <= self.ulim]
+            # constr += [
+            #     -self.ylim <= C @ x[:, [t]],
+            #     C @ x[:, [t]] <= self.ylim,
+            # ]
 
-        constr += [self.MT @ x[:, [self.horizon]] <= self.mt]
-        cost += cp.quad_form(x[:, self.horizon], self.QT)
+        # constr += [self.MT @ x[:, [self.horizon]] <= self.mt]
+        # cost += cp.quad_form(x[:, self.horizon], self.QT)
         problem = cp.Problem(cp.Minimize(cost), constr)
 
-        if problem.solve(verbose=True) == False:
+        if problem.solve(verbose=True) == False or u.value == None:
             raise Exception(
                 f"Failed to converge to solution with values {x.value}, {u.value}"
             )
@@ -71,8 +72,16 @@ class Pendulum:
         self.dt = dt
         self.theta_ref = theta_ref
 
+        self.A = self.linearlize_pendulum(np.pi / 2, 0)
+        self.B = np.array([[0, 1 / (self.m * self.l**2), 0]]).T
+        self.C = np.eye(3)
+        self.D = np.zeros(1)
+
     def get_current_state(self):
         return self.x_current
+
+    def get_system(self):
+        return self.A, self.B, self.C, self.D
 
     def linearlize_pendulum(self, theta, omega):
 
@@ -80,7 +89,7 @@ class Pendulum:
             [
                 [0, 1, 0],
                 [
-                    -omega * (self.g / self.l) * np.cos(theta),
+                    -(self.g / self.l) * np.cos(theta),
                     self.b / (self.m * self.l**2),
                     0,
                 ],
@@ -125,13 +134,14 @@ class Pendulum:
 
         x_traj = np.zeros((timesteps, 3))  # is a column vector
         x_traj[0, :] = x0
+        self.x_current = x0
 
         u_traj = np.zeros((timesteps, 1))
 
         for i in range(0, timesteps - 1):
 
             # get optimal control for first state
-            u = controller.control_action(self)
+            u = controller.control_action()
 
             u_traj[i, :] = u  # use first optimal control value
 
@@ -144,15 +154,26 @@ class Pendulum:
 
 
 if __name__ == "__main__":
-
     # System parameters
     l = 1.0  # length
     m = 1.0  # mass
     b = 0.1  # damping
 
+    # Initial state
+    theta0 = np.pi
+    omega0 = 0.0
+    z0 = 0.0
+    x0 = np.array([theta0, omega0, z0])
+
+    # Simulator parameters
+    T = 30
+    dt = 0.1
+    theta_ref = 0  # to easily test different reference values
+    pendulum = Pendulum(l, m, b, x0, dt, theta_ref)
+
     # Define controller
     Q = np.diag([1, 1, 1])  # weight on theta, omega and z
-    R = np.array([[1]])  # weight on control effort
+    R = np.array([[0.1]])  # weight on control effort
     QT = np.diag([0.1, 0.1, 0.1])
 
     # state limits
@@ -168,24 +189,9 @@ if __name__ == "__main__":
     MT = np.eye(3)
     mt = np.diag([[0.1, 0.1, 0.1]]).T
 
-    mpc = mpc_controller(Q, R, QT, ulim, xlim, MT, mt, horizon=20)
+    mpc = mpc_controller(pendulum, Q, R, QT, ulim, xlim, MT, mt, horizon=20)
 
-    theta_ref1 = np.pi * 1 / 4
-    theta_ref2 = np.pi * 1 / 2
-    theta_ref3 = np.pi * 3 / 4
-    theta_ref4 = np.pi
-    # Initial state
-    theta0 = np.pi
-    omega0 = 0.0
-    z0 = 0.0
-    x0 = np.array([theta0, omega0, z0])
-
-    # Simulator parameters
-    T = 30
-    dt = 0.1
-    theta_ref = 0  # to easily test different reference values
-    pendulum = Pendulum(l, m, b, x0, dt, theta_ref)
-    xs, u = pendulum.simulate_pendelum_with_controller(x0, T, mpc_controller)
+    xs, u = pendulum.simulate_pendelum_with_controller(x0, T, mpc)
     time = np.arange(0, T, dt)
 
     # Plot results
